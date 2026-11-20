@@ -17,6 +17,8 @@
     "secrets:upload": "wrangler secret bulk .dev.vars"
   },
   "dependencies": {
+    "@neon/config": "^1.14.5",
+    "@neon/env": "^2.1.8",
     "hono": "^4.13.19",
     "pdf-lib": "^1.17.1",
     "postgres": "^3.4.9",
