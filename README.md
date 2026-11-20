@@ -13,6 +13,17 @@ Browser ──► Vercel (static site)
   └─ WebSocket (live flight status) ───────────────────────────────► Neon Realtime
 ```
 
+## Live deployment
+
+| | |
+| --- | --- |
+| Website | https://adinkra-airways.vercel.app (Vercel project `adinkra-airways`, deploys on every push to Adinkra-frontend) |
+| API Worker | https://adinkra-airways-api.ahorsodebenjamindelali.workers.dev (`npm run deploy` from this folder) |
+| Database | Neon project `Adinkra`, branch `production` (aws-us-east-2), through Hyperdrive `adinkra-db` (caching off) |
+| Auth / Realtime | Neon Auth and Neon Realtime on the same branch; trusted origin `https://adinkra-airways.vercel.app` |
+
+Check it any time with `node scripts/smoke.js https://adinkra-airways.vercel.app`.
+
 ## What changed from the original server
 
 | Original (Express + SQLite) | Hosted version |

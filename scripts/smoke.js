@@ -10,11 +10,19 @@ function client() {
     const t = Date.now();
     const res = await fetch(base + path, {
       method,
-      headers: { 'X-Requested-With': 'fetch', ...(body ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}), ...headers },
+      // Browsers send Origin on POSTs; Neon Auth only accepts its trusted domains.
+      headers: { 'X-Requested-With': 'fetch', Origin: new URL(base).origin, ...(body ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}), ...headers },
       body: body ? JSON.stringify(body) : undefined,
     });
-    const set = res.headers.get('set-cookie');
-    if (set) cookie = set.split(';')[0];
+    // Keep every cookie (Neon Auth sets a session token and a cached-session cookie).
+    const jar = new Map(cookie ? cookie.split('; ').map((c) => [c.slice(0, c.indexOf('=')), c.slice(c.indexOf('=') + 1)]) : []);
+    for (const sc of res.headers.getSetCookie()) {
+      const pair = sc.split(';')[0];
+      const i = pair.indexOf('=');
+      if (pair.slice(i + 1)) jar.set(pair.slice(0, i), pair.slice(i + 1));
+      else jar.delete(pair.slice(0, i));
+    }
+    cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
     const type = res.headers.get('content-type') || '';
     const data = type.includes('json') ? await res.json() : new Uint8Array(await res.arrayBuffer());
     console.log(`${String(res.status).padEnd(4)} ${String(Date.now() - t).padStart(5)} ms  ${method} ${path}`);
