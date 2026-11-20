@@ -5,7 +5,8 @@ import { Hono } from 'hono';
 import { h } from '../http.js';
 import { one, run, insert, nowIso, settingNum } from '../db.js';
 import { HttpError, bad, passwordProblem, encrypt, audit, makeLimiter, appUserFor } from '../security.js';
-import { neonAuth, clearAuthCookies, authFailure } from '../neonauth.js';
+import { neonAuth, clearAuthCookies, authFailure, config as authConfig } from '../neonauth.js';
+import { processAuthMiddleware, DEFAULT_AUTH_SKIP_ROUTES } from '@neon/auth/server';
 
 const router = new Hono();
 const loginLimiter = makeLimiter('login', { max: 5, windowMs: 15 * 60000 });
@@ -19,7 +20,12 @@ export const cleanPhone = (p) => String(p || '').replace(/[\s()-]/g, '');
 const publicUser = (u) => ({
   id: u.id, name: u.name, email: u.email, role: u.role,
   permissions: Array.isArray(u.permissions) ? u.permissions : JSON.parse(u.permissions || '[]'),
+  // Google sign-ups still owe a phone number and Ghana Card (the website asks once).
+  needsProfile: !!(u.needsProfile ?? u.needs_profile),
 });
+
+/** Only same-site hash routes like "/trips" or "/book?x=1" may be used as a post-login destination. */
+const safeNext = (v) => (typeof v === 'string' && /^\/(?!\/)[\w\-/?=&%.]*$/.test(v) && v.length <= 200 ? v : '/trips');
 
 router.post('/register', h(async (req, c) => {
   const { name, email, phone, nationalId, password } = req.body || {};
@@ -101,6 +107,84 @@ router.post('/logout', h(async (req, c) => {
 }));
 
 router.get('/me', h((req, c) => c.json({ user: req.user ? publicUser(req.user) : null })));
+
+// ---------- Continue with Google (Neon Auth social sign-in) ----------
+// 1. POST /google      → Neon Auth returns Google's URL and sets a short-lived challenge cookie.
+// 2. Google → Neon Auth → GET /callback?neon_auth_session_verifier=… on this site; the toolkit
+//    exchanges the verifier + challenge cookie for a first-party session.
+// 3. The website calls POST /oauth-finish, which links or creates the Adinkra profile.
+router.post('/google', h(async (req, c) => {
+  const origin = req.get('origin');
+  if (!origin) throw bad('Missing Origin header');
+  const next = safeNext(req.body?.next);
+  const { data, error } = await neonAuth().signIn.social({
+    provider: 'google',
+    callbackURL: `${origin}/api/auth/callback?next=${encodeURIComponent(next)}`,
+  });
+  if (error || !data?.url) throw authFailure(error, 'Google sign-in is not available right now. Please use your email and password.');
+  await audit(req, 'auth.google_start', { target: origin });
+  return c.json({ url: data.url });
+}));
+
+router.get('/callback', async (c) => {
+  const req = c.get('req');
+  const next = safeNext(req.query.next);
+  const fail = (why) => {
+    console.warn('Google sign-in callback failed:', why);
+    return c.redirect(`/#/login?error=google&next=${encodeURIComponent(next)}`, 302);
+  };
+  if (req.query.error) return fail(String(req.query.error).slice(0, 80));
+  const { baseUrl, cookieSecret } = authConfig();
+  const result = await processAuthMiddleware({
+    request: c.req.raw,
+    pathname: '/api/auth/callback',
+    skipRoutes: DEFAULT_AUTH_SKIP_ROUTES,
+    loginUrl: '/__adinkra-login-page', // never matches; the exchange is all we need here
+    baseUrl,
+    cookieSecret,
+  });
+  if (result.action !== 'redirect_oauth') return fail(`no verifier exchange (${result.action})`);
+  for (const cookie of result.cookies) c.header('Set-Cookie', cookie, { append: true });
+  return c.redirect(`/#/oauth-finish?next=${encodeURIComponent(next)}`, 302);
+});
+
+router.post('/oauth-finish', h(async (req, c) => {
+  const { data, error } = await neonAuth().getSession();
+  if (error || !data?.user) throw new HttpError(401, 'Google sign-in did not finish. Please try again.');
+  const nu = data.user;
+  const email = String(nu.email || '').trim().toLowerCase();
+  let u = await appUserFor(nu.id);
+  let created = false;
+  if (!u) {
+    const byEmail = await one('SELECT id, auth_user_id FROM users WHERE email = ?', email);
+    if (byEmail && !byEmail.auth_user_id && nu.emailVerified) {
+      await run('UPDATE users SET auth_user_id = ? WHERE id = ?', nu.id, byEmail.id);
+    } else if (byEmail) {
+      clearAuthCookies(c);
+      await audit(req, 'auth.google_conflict', { target: email, severity: 'warn' });
+      throw new HttpError(409, 'An Adinkra Airways account already uses this email. Sign in with your password instead.');
+    } else {
+      if (!EMAIL_RE.test(email)) throw bad('Your Google account has no usable email address');
+      const name = String(nu.name || email.split('@')[0]).trim().slice(0, 80) || 'Traveller';
+      const ff = `ADK${String(Math.floor(Math.random() * 1e7)).padStart(7, '0')}`;
+      const id = await insert(
+        `INSERT INTO users (name, email, auth_user_id, role, frequent_flyer_no) VALUES (?,?,?, 'traveler', ?)`,
+        name, email, nu.id, ff,
+      );
+      created = true;
+      await audit(req, 'auth.register', { target: email, userId: id, details: 'google' });
+    }
+    u = await appUserFor(nu.id);
+  }
+  if (!u.active) {
+    clearAuthCookies(c);
+    await audit(req, 'auth.login_inactive', { target: email, severity: 'warn', userId: u.id });
+    throw new HttpError(403, 'This account has been deactivated. Contact an administrator.');
+  }
+  await run('UPDATE users SET last_login = ? WHERE id = ?', nowIso(), u.id);
+  await audit(req, 'auth.login', { target: email, userId: u.id, details: 'google' });
+  return c.json({ user: publicUser(u), created });
+}));
 
 // ---------- Forgotten password: 6-digit code by email (Neon Auth email OTP) ----------
 router.post('/forgot-password', h(async (req, c) => {

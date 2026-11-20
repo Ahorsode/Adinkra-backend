@@ -37,7 +37,7 @@ function requestContext() {
   };
 }
 
-function config() {
+export function config() {
   const baseUrl = envVar('NEON_AUTH_BASE_URL');
   const cookieSecret = envVar('NEON_AUTH_COOKIE_SECRET');
   if (!baseUrl || !cookieSecret) {

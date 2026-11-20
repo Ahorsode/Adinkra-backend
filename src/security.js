@@ -102,7 +102,12 @@ export function parseCookies(header) {
 
 /** The app profile (role, permissions, active flag) linked to a Neon Auth user id. */
 export const appUserFor = (authUserId) =>
-  one('SELECT id, name, email, role, permissions, active FROM users WHERE auth_user_id = ?', authUserId);
+  one(
+    `SELECT id, name, email, role, permissions, active,
+       (role = 'traveler' AND (phone IS NULL OR national_id_enc IS NULL)) AS needs_profile
+     FROM users WHERE auth_user_id = ?`,
+    authUserId,
+  );
 
 /**
  * Resolves the signed-in user from the Neon Auth session cookies, then applies the app's own rules:
@@ -121,7 +126,10 @@ export async function loadUser(req) {
   if (!u || !u.active) return null;
   const hours = await settingNum('session_timeout_hours');
   if (Date.parse(data.session.createdAt) + hours * 3600000 < Date.now()) return null;
-  return { id: u.id, name: u.name, email: u.email, role: u.role, permissions: JSON.parse(u.permissions), authUserId: data.user.id };
+  return {
+    id: u.id, name: u.name, email: u.email, role: u.role, permissions: JSON.parse(u.permissions),
+    authUserId: data.user.id, needsProfile: !!u.needs_profile,
+  };
 }
 
 // ---------- Role-based access control (Hono middleware) ----------

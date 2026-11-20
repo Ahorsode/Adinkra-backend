@@ -147,6 +147,39 @@ test('Neon Auth: register, session, sign out, sign in, change password, reset co
   assert.equal(r.status, 400, JSON.stringify(r.body));
 });
 
+test('Continue with Google: start, failed callback, finish guard, complete profile', async () => {
+  const c = client();
+  // Start: Neon Auth hands back its Google entry URL and sets the challenge cookie on our domain.
+  const start = await c.post('/api/auth/google', { next: '/trips' });
+  assert.equal(start.status, 200, JSON.stringify(start.body));
+  const url = new URL(start.body.url);
+  assert.equal(url.origin, new URL(process.env.NEON_AUTH_BASE_URL).origin);
+  assert.match(url.pathname, /\/sign-in\/social/);
+  assert.ok([...start.jar.keys()].some((k) => k.includes('session_challenge')), 'challenge cookie set');
+  // An unsafe "next" falls back to /trips rather than leaving the site.
+  const evil = await c.post('/api/auth/google', { next: '//evil.example/x' });
+  assert.equal(evil.status, 200);
+  // Coming back without a valid verifier, or with a Google error, lands on the login page.
+  for (const qs of ['next=%2Ftrips', 'error=access_denied']) {
+    const cb = await c.get(`/api/auth/callback?${qs}`);
+    assert.equal(cb.status, 302);
+    assert.match(cb.headers.get('location'), /^\/#\/login\?error=google/);
+  }
+  // Finishing without a Neon session is refused.
+  assert.equal((await client().post('/api/auth/oauth-finish')).status, 401);
+
+  // A traveller without phone + Ghana Card (as after a Google sign-up) is flagged until they add them.
+  const email = `g.${RUN}@example.com`;
+  const g = client();
+  assert.equal((await g.post('/api/auth/register', { name: 'Google Person', email, phone: '0241112222', nationalId: 'GHA-123456789-0', password: 'abc12345' })).status, 201);
+  await one('UPDATE users SET phone = NULL, national_id_enc = NULL WHERE email = ? RETURNING id', email);
+  assert.equal((await g.get('/api/auth/me')).body.user.needsProfile, true);
+  assert.equal((await g.put('/api/profile/complete', { phone: '0241112222', nationalId: 'bad' })).status, 400);
+  assert.equal((await g.put('/api/profile/complete', { phone: '0241112222', nationalId: 'gha-712345678-3' })).status, 200);
+  assert.equal((await g.get('/api/auth/me')).body.user.needsProfile, false);
+  assert.equal((await client().put('/api/profile/complete', { phone: '0241112222', nationalId: 'GHA-712345678-3' })).status, 401);
+});
+
 test('login lockout after repeated failures', async () => {
   const c = client();
   for (let i = 0; i < 5; i++) assert.equal((await c.post('/api/auth/login', { email: 'nobody@example.com', password: 'x' })).status, 401);

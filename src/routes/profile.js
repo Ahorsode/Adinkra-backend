@@ -3,7 +3,7 @@ import { h } from '../http.js';
 import { one, all, run } from '../db.js';
 import { bad, HttpError, requireAuth, encrypt, decrypt, mask, passwordProblem, audit } from '../security.js';
 import { neonAuth, authFailure } from '../neonauth.js';
-import { PHONE_RE, cleanPhone } from './auth.js';
+import { PHONE_RE, GHANA_CARD_RE, cleanPhone } from './auth.js';
 
 const router = new Hono();
 router.use('*', requireAuth);
@@ -64,6 +64,17 @@ router.put('/', h(async (req, c) => {
   );
   await audit(req, 'profile.update', { target: req.user.email, details: { passportChanged: !!passport } });
   return c.json({ profile: await profileOf(req.user.id) });
+}));
+
+/** First visit after "Continue with Google": the phone number and Ghana Card normal registration asks for. */
+router.put('/complete', h(async (req, c) => {
+  const phone = cleanPhone(req.body?.phone);
+  const gc = String(req.body?.nationalId || '').trim().toUpperCase();
+  if (!PHONE_RE.test(phone)) throw bad('Enter a valid phone number');
+  if (!GHANA_CARD_RE.test(gc)) throw bad('Ghana Card number must look like GHA-123456789-0');
+  await run('UPDATE users SET phone = ?, national_id_enc = ? WHERE id = ?', phone, encrypt(gc), req.user.id);
+  await audit(req, 'profile.complete', { target: req.user.email });
+  return c.json({ ok: true, profile: await profileOf(req.user.id) });
 }));
 
 /** Returns the saved passport (decrypted) so the booking form can prefill it for the account holder. */
