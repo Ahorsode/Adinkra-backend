@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "adinkra-airways-api",
+  "main": "src/index.js",
+  "compatibility_date": "2026-11-01",
+  // node:crypto (AES-GCM, HMAC), node:async_hooks and Buffer.
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+
+  // Neon Postgres through Hyperdrive (connection pooling close to the Worker).
+  // Create it once with (caching off, so a booking never shows stale seats or status):
+  //   npx wrangler hyperdrive create adinkra-db --caching-disabled --connection-string="<Neon direct connection string>"
+  // and paste the id it prints below.
+  "hyperdrive": [
+    {
+      "binding": "HYPERDRIVE",
+      "id": "REPLACE_WITH_YOUR_HYPERDRIVE_ID",
+      // Used by `wrangler dev` only (see `npm run db:local`).
+      "localConnectionString": "postgres://postgres:postgres@127.0.0.1:5433/postgres"
+    }
+  ],
+
+  // Releases seats from unpaid bookings whose 20-minute hold has expired.
+  "triggers": { "crons": ["* * * * *"] }
+
+  // Secrets (never commit them): DATA_KEY and HMAC_KEY, 64 hex chars each.
+  //   npx wrangler secret put DATA_KEY
+  //   npx wrangler secret put HMAC_KEY
+  // For `wrangler dev`, put them in .dev.vars instead.
+}

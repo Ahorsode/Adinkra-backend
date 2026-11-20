@@ -1,0 +1,29 @@
+{
+  "name": "adinkra-airways-api",
+  "version": "1.0.0",
+  "description": "Adinkra Airways API on Cloudflare Workers + Neon Postgres",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:schema": "node scripts/apply-schema.js",
+    "db:seed": "node scripts/seed.js",
+    "db:reset": "node scripts/seed.js --reset",
+    "db:local": "node scripts/local-db.js",
+    "test": "node --test test/*.test.js",
+    "secrets:generate": "node scripts/generate-keys.js"
+  },
+  "dependencies": {
+    "hono": "^4.13.19",
+    "pdf-lib": "^1.17.1",
+    "postgres": "^3.4.9",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.17",
+    "@electric-sql/pglite-socket": "^0.2.20",
+    "wrangler": "^4.165.0"
+  }
+}
