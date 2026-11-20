@@ -1,11 +1,23 @@
-// End-to-end API tests covering the assignment's user scenarios.
-// Runs the Hono app against a throw-away in-memory Postgres (PGlite): `npm test`.
+// End-to-end API tests covering the assignment's user scenarios: `npm test`.
+//
+// App data: a throw-away in-memory Postgres (PGlite).
+// Sign-in: Neon Auth on the Neon *dev* branch (NEON_AUTH_BASE_URL from .env.dev), never production.
+// Accounts the tests create use unique emails, so runs don't collide; the demo accounts are created
+// on the dev branch on first run and reused afterwards.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 
 process.env.DATA_KEY ||= crypto.randomBytes(32).toString('hex');
 process.env.HMAC_KEY ||= crypto.randomBytes(32).toString('hex');
+process.env.NEON_AUTH_COOKIE_SECRET ||= crypto.randomBytes(32).toString('base64');
+if (!process.env.NEON_AUTH_BASE_URL) {
+  console.error('NEON_AUTH_BASE_URL is not set. Create the dev branch env first: neon env pull --branch dev --file .env.dev');
+  process.exit(1);
+}
+
+const RUN = Date.now().toString(36);
+const ORIGIN = 'http://localhost:3000'; // a trusted origin on every Neon Auth branch
 
 const { startLocalDb } = await import('../scripts/local-db.js');
 const { seedIfEmpty, DEMO_ACCOUNTS } = await import('../scripts/seed.js');
@@ -29,19 +41,35 @@ after(async () => {
   await local.stop();
 });
 
-/** Minimal client that keeps the session cookie, like a browser. */
+/** Minimal client that keeps cookies like a browser (Neon Auth sets several per response). */
 function client() {
-  let cookie = '';
-  const call = async (method, url, body, headers = {}) => {
+  const jar = new Map();
+  // Neon Auth allows ~10 auth calls per few seconds per IP, and this suite makes many in a row from
+  // one machine: when Neon (not the app's own lockout) says "too many", wait and retry.
+  const call = async (method, url, body, headers = {}, tries = 0) => {
+    const r = await send(method, url, body, headers);
+    if (r.status === 429 && r.body?.error?.startsWith('Too many attempts. Please wait') && tries < 4) {
+      await new Promise((ok) => setTimeout(ok, 11000));
+      return call(method, url, body, headers, tries + 1);
+    }
+    return r;
+  };
+  const send = async (method, url, body, headers) => {
+    const cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
     const res = await app.fetch(new Request(base + url, {
       method,
-      headers: { 'X-Requested-With': 'fetch', ...(body ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}), ...headers },
+      headers: { 'X-Requested-With': 'fetch', Origin: ORIGIN, ...(body ? { 'Content-Type': 'application/json' } : {}), ...(cookie ? { Cookie: cookie } : {}), ...headers },
       body: body ? JSON.stringify(body) : undefined,
     }));
-    const set = res.headers.get('set-cookie');
-    if (set) cookie = set.split(';')[0];
+    for (const sc of res.headers.getSetCookie()) {
+      const [pair, ...attrs] = sc.split(';');
+      const i = pair.indexOf('=');
+      const [name, value] = [pair.slice(0, i).trim(), pair.slice(i + 1).trim()];
+      if (!value || attrs.some((a) => /max-age=0\b/i.test(a.trim()))) jar.delete(name);
+      else jar.set(name, value);
+    }
     const type = res.headers.get('content-type') || '';
-    return { status: res.status, body: type.includes('json') ? await res.json() : Buffer.from(await res.arrayBuffer()), headers: res.headers };
+    return { status: res.status, body: type.includes('json') ? await res.json() : Buffer.from(await res.arrayBuffer()), headers: res.headers, jar };
   };
   return {
     get: (u, h) => call('GET', u, null, h),
@@ -74,19 +102,49 @@ test('health check and security headers', async () => {
   assert.equal(r.headers.get('cache-control'), 'no-store');
 });
 
-test('registration validates Ghana Card and stores it encrypted', async () => {
+test('Neon Auth: register, session, sign out, sign in, change password, reset code', async () => {
+  const email = `t.${RUN}@example.com`;
   const c = client();
-  const bad = await c.post('/api/auth/register', { name: 'Test User', email: 't@example.com', phone: '0241112222', nationalId: '123', password: 'abc12345' });
+  const bad = await c.post('/api/auth/register', { name: 'Test User', email, phone: '0241112222', nationalId: '123', password: 'abc12345' });
   assert.equal(bad.status, 400);
-  const ok = await c.post('/api/auth/register', { name: 'Test User', email: 't@example.com', phone: '0241112222', nationalId: 'GHA-123456789-0', password: 'abc12345' });
+  const ok = await c.post('/api/auth/register', { name: 'Test User', email, phone: '0241112222', nationalId: 'GHA-123456789-0', password: 'abc12345' });
   assert.equal(ok.status, 201, JSON.stringify(ok.body));
-  assert.match(ok.headers.get('set-cookie'), /HttpOnly; SameSite=Strict; Path=\/; Max-Age=\d+; Secure/);
-  const row = await one("SELECT national_id_enc, password_hash FROM users WHERE email = 't@example.com'");
+  const cookies = ok.headers.getSetCookie().join('\n');
+  assert.match(cookies, /__Secure-neon-auth\.session_token=[^;]+;.*HttpOnly/i, 'Neon Auth session cookie set first-party');
+  assert.match(cookies, /Secure/);
+  const row = await one('SELECT national_id_enc, password_hash, auth_user_id FROM users WHERE email = ?', email);
   assert.match(row.national_id_enc, /^v1:/);
   assert.ok(!row.national_id_enc.includes('123456789'));
-  assert.match(row.password_hash, /^pbkdf2\$100000\$/);
-  const me = await c.get('/api/auth/me');
-  assert.equal(me.body.user.email, 't@example.com');
+  assert.equal(row.password_hash, null, 'the API stores no password');
+  assert.match(row.auth_user_id, /^[0-9a-f-]{36}$/, 'linked to the Neon Auth user');
+  assert.equal((await c.post('/api/auth/register', { name: 'Test User', email, phone: '0241112222', nationalId: 'GHA-123456789-0', password: 'abc12345' })).status, 409);
+
+  // Session restores on the next request (like a page reload), then signs out.
+  assert.equal((await c.get('/api/auth/me')).body.user.email, email);
+  assert.equal((await c.get('/api/profile')).status, 200);
+  await c.post('/api/auth/logout');
+  assert.equal((await c.get('/api/auth/me')).body.user, null);
+  assert.equal((await c.get('/api/profile')).status, 401, 'protected route denied when signed out');
+
+  // Wrong password → clear message; right password → signed in again.
+  const wrong = await c.post('/api/auth/login', { email, password: 'nope12345' });
+  assert.equal(wrong.status, 401);
+  assert.equal(wrong.body.error, 'Incorrect email or password');
+  await c.login({ email, password: 'abc12345' });
+
+  // Change password through Neon Auth, then sign in with the new one.
+  assert.equal((await c.put('/api/profile/password', { currentPassword: 'wrong999', newPassword: 'Newpass123' })).status, 401);
+  assert.equal((await c.put('/api/profile/password', { currentPassword: 'abc12345', newPassword: 'Newpass123' })).status, 200);
+  const fresh = client();
+  assert.equal((await fresh.post('/api/auth/login', { email, password: 'abc12345' })).status, 401);
+  await fresh.login({ email, password: 'Newpass123' });
+
+  // Forgotten password: request a code (same answer for unknown emails), wrong code rejected.
+  const anon = client();
+  assert.equal((await anon.post('/api/auth/forgot-password', { email })).status, 200);
+  assert.equal((await anon.post('/api/auth/forgot-password', { email: `nobody.${RUN}@example.com` })).status, 200);
+  const r = await anon.post('/api/auth/reset-password', { email, code: '000000', password: 'Another123' });
+  assert.equal(r.status, 400, JSON.stringify(r.body));
 });
 
 test('login lockout after repeated failures', async () => {
@@ -317,14 +375,20 @@ test('Admin scenarios 3.1–3.5', async () => {
   assert.ok(an.body.kpis.grossRevenue > 0);
   assert.ok(an.body.weekly.length > 0 && an.body.topRoutes.length > 0 && an.body.methods.length > 0);
   // 3.3 staff access
-  const u = await a.post('/api/admin/users', { name: 'New Gate Agent', email: 'gate@adinkra-air.test', role: 'staff', password: 'Welcome@2026', permissions: ['gate'] });
-  assert.equal(u.status, 201);
+  const gateEmail = `gate.${RUN}@adinkra-air.test`;
+  const u = await a.post('/api/admin/users', { name: 'New Gate Agent', email: gateEmail, role: 'staff', password: 'Welcome@2026', permissions: ['gate'] });
+  assert.equal(u.status, 201, JSON.stringify(u.body));
+  assert.equal((await a.get('/api/auth/me')).body.user.email, DEMO_ACCOUNTS.admin.email, 'admin is still signed in as themselves');
   const g = client();
-  await g.login({ email: 'gate@adinkra-air.test', password: 'Welcome@2026' });
+  await g.login({ email: gateEmail, password: 'Welcome@2026' });
   assert.equal((await g.get('/api/staff/support')).status, 403);
   assert.equal((await g.get('/api/staff/flights')).status, 200);
   const users = await a.get('/api/admin/users?q=gate');
-  assert.ok(users.body.users.some((x) => x.email === 'gate@adinkra-air.test'));
+  assert.ok(users.body.users.some((x) => x.email === gateEmail));
+  // Deactivating an account locks it out on its next request, even with a live Neon Auth session.
+  assert.equal((await a.put(`/api/admin/users/${u.body.user.id}`, { active: false })).status, 200);
+  assert.equal((await g.get('/api/staff/flights')).status, 401);
+  assert.equal((await client().post('/api/auth/login', { email: gateEmail, password: 'Welcome@2026' })).status, 403);
   // 3.4 occupancy
   const oc = await a.get('/api/admin/occupancy?window=past30');
   assert.ok(oc.body.routes.length > 0 && oc.body.overall > 0);
@@ -338,4 +402,21 @@ test('Admin scenarios 3.1–3.5', async () => {
   assert.equal(set.body.settings.booking_hold_minutes, '25');
   const purge = await a.post('/api/admin/retention/purge');
   assert.equal(purge.status, 200);
+});
+
+test('Realtime: sealed live queries for the board and status pages', { skip: !process.env.NEON_REALTIME_SECRET && 'NEON_REALTIME_SECRET not set' }, async () => {
+  const c = client();
+  const b1 = await c.get('/api/live/board?airport=ACC&type=departures');
+  assert.equal(b1.status, 200, JSON.stringify(b1.body));
+  assert.match(b1.body.url, /^wss?:\/\//);
+  assert.ok(b1.body.sealed.capability && b1.body.sealed.queryFingerprint);
+  assert.ok(b1.body.sealed.expiresAt > Date.now());
+  // Renewal must seal the identical query (same fingerprint) or the subscription would be dropped.
+  const b2 = await c.get('/api/live/board?airport=ACC&type=departures');
+  assert.equal(b2.body.sealed.queryFingerprint, b1.body.sealed.queryFingerprint);
+  const arr = await c.get('/api/live/board?airport=ACC&type=arrivals');
+  assert.notEqual(arr.body.sealed.queryFingerprint, b1.body.sealed.queryFingerprint);
+  assert.equal((await c.get(`/api/live/status?flightNo=AD201&date=${day(0)}`)).status, 200);
+  assert.equal((await c.get(`/api/live/status?from=LOS&to=ACC&date=${day(0)}`)).status, 200);
+  assert.equal((await c.get('/api/live/status?flightNo=bad')).status, 400);
 });

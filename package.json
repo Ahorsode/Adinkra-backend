@@ -12,13 +12,17 @@
     "db:seed": "node --env-file-if-exists=.dev.vars --env-file-if-exists=.env scripts/seed.js",
     "db:reset": "node --env-file-if-exists=.dev.vars --env-file-if-exists=.env scripts/seed.js --reset",
     "db:local": "node scripts/local-db.js",
-    "test": "node --test test/*.test.js",
+    "test": "node --env-file-if-exists=.env.dev --test test/*.test.js",
     "secrets:generate": "node scripts/generate-keys.js",
-    "secrets:upload": "wrangler secret bulk .dev.vars"
+    "secrets:upload": "wrangler secret bulk .dev.vars",
+    "db:link-auth": "node --env-file-if-exists=.dev.vars --env-file-if-exists=.env scripts/seed.js --link-auth",
+    "secrets:sync": "node scripts/sync-neon-env.js"
   },
   "dependencies": {
+    "@neon/auth": "~0.8.2",
     "@neon/config": "^1.14.5",
     "@neon/env": "^2.1.8",
+    "@neon/realtime": "~0.2.1",
     "hono": "^4.13.19",
     "pdf-lib": "^1.17.1",
     "postgres": "^3.4.9",

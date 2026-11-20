@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { keys } from './config.js';
-import { one, run, nowIso, settingNum } from './db.js';
+import { one, run, settingNum } from './db.js';
+import { neonAuth, hasAuthCookie } from './neonauth.js';
 
 const dataKey = () => Buffer.from(keys().dataKey, 'hex');
 const hmacKey = () => Buffer.from(keys().hmacKey, 'hex');
@@ -14,30 +15,9 @@ export class HttpError extends Error {
 }
 export const bad = (msg, extra) => new HttpError(400, msg, extra);
 
-// ---------- Passwords (PBKDF2-SHA256 via WebCrypto, per-user salt) ----------
-// scrypt is too CPU-heavy for Workers; 100,000 iterations is the Workers maximum for PBKDF2.
-export const PBKDF2_ITERATIONS = 100000;
-async function pbkdf2(pw, salt, iterations, bytes = 32) {
-  const key = await globalThis.crypto.subtle.importKey('raw', new TextEncoder().encode(String(pw)), 'PBKDF2', false, ['deriveBits']);
-  const bits = await globalThis.crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, key, bytes * 8);
-  return Buffer.from(bits);
-}
-export async function hashPassword(pw) {
-  const salt = crypto.randomBytes(16);
-  const hash = await pbkdf2(pw, salt, PBKDF2_ITERATIONS);
-  return `pbkdf2$${PBKDF2_ITERATIONS}$${salt.toString('hex')}$${hash.toString('hex')}`;
-}
-export async function verifyPassword(pw, stored) {
-  try {
-    const [alg, iter, salt, hash] = String(stored).split('$');
-    if (alg !== 'pbkdf2') return false;
-    const expected = Buffer.from(hash, 'hex');
-    const actual = await pbkdf2(pw, Buffer.from(salt, 'hex'), Number(iter), expected.length);
-    return crypto.timingSafeEqual(actual, expected);
-  } catch {
-    return false;
-  }
-}
+// ---------- Passwords ----------
+// Passwords are stored and checked by Neon Auth (see neonauth.js); this is the app's own policy,
+// enforced before a password is sent there.
 export async function passwordProblem(pw) {
   const min = await settingNum('password_min_length');
   if (typeof pw !== 'string' || pw.length < min) return `Password must be at least ${min} characters`;
@@ -120,33 +100,28 @@ export function parseCookies(header) {
   return out;
 }
 
-export async function createSession(req, userId) {
-  const token = randomToken();
-  const hours = await settingNum('session_timeout_hours');
-  const expires = new Date(Date.now() + hours * 3600000).toISOString();
-  await run('INSERT INTO sessions (token_hash, user_id, ip, expires_at) VALUES (?,?,?,?)', sha256(token), userId, req.ip, expires);
-  const secure = req.secure ? '; Secure' : '';
-  req.c.header('Set-Cookie', `${SESSION_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${hours * 3600}${secure}`);
-}
+/** The app profile (role, permissions, active flag) linked to a Neon Auth user id. */
+export const appUserFor = (authUserId) =>
+  one('SELECT id, name, email, role, permissions, active FROM users WHERE auth_user_id = ?', authUserId);
 
-export async function destroySession(req) {
-  const tok = parseCookies(req.get('cookie'))[SESSION_COOKIE];
-  if (tok) await run('DELETE FROM sessions WHERE token_hash = ?', sha256(tok));
-  req.c.header('Set-Cookie', `${SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
-}
-
+/**
+ * Resolves the signed-in user from the Neon Auth session cookies, then applies the app's own rules:
+ * the account must be linked and active, and the session must be younger than the admin's
+ * "session timeout" setting (Neon Auth sessions themselves last 7 days).
+ */
 export async function loadUser(req) {
-  const tok = parseCookies(req.get('cookie'))[SESSION_COOKIE];
-  if (!tok) return null;
-  const s = await one(
-    `SELECT s.expires_at, u.id, u.name, u.email, u.role, u.permissions, u.active
-     FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?`,
-    sha256(tok),
-  );
-  if (s && s.active && s.expires_at > nowIso()) {
-    return { id: s.id, name: s.name, email: s.email, role: s.role, permissions: JSON.parse(s.permissions) };
+  if (!hasAuthCookie(req.get('cookie'))) return null;
+  const { data, error } = await neonAuth().getSession();
+  if (error) {
+    console.error('Neon Auth getSession failed', error.code, error.message);
+    return null;
   }
-  return null;
+  if (!data?.user || !data.session) return null;
+  const u = await appUserFor(data.user.id);
+  if (!u || !u.active) return null;
+  const hours = await settingNum('session_timeout_hours');
+  if (Date.parse(data.session.createdAt) + hours * 3600000 < Date.now()) return null;
+  return { id: u.id, name: u.name, email: u.email, role: u.role, permissions: JSON.parse(u.permissions), authUserId: data.user.id };
 }
 
 // ---------- Role-based access control (Hono middleware) ----------

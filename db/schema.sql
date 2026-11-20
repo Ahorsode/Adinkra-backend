@@ -11,7 +11,10 @@ CREATE TABLE IF NOT EXISTS users (
   email text NOT NULL UNIQUE,
   phone text,
   national_id_enc text,
-  password_hash text NOT NULL,
+  -- Sign-in is handled by Neon Auth (neon_auth schema); this links the app profile to that account.
+  auth_user_id text UNIQUE,
+  -- Legacy column from the pre-Neon-Auth version; no longer written.
+  password_hash text,
   role text NOT NULL DEFAULT 'traveler' CHECK (role IN ('traveler','staff','admin')),
   permissions text NOT NULL DEFAULT '[]',
   active integer NOT NULL DEFAULT 1,
@@ -26,6 +29,11 @@ CREATE TABLE IF NOT EXISTS users (
   created_at text NOT NULL DEFAULT iso_now(),
   last_login text
 );
+-- Upgrade databases created before Neon Auth (both statements are no-ops on a fresh database).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_user_id text UNIQUE;
+ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;
+
+-- Unused since Neon Auth took over sessions; kept so older databases upgrade cleanly.
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash text PRIMARY KEY,
   user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,

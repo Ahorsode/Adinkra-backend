@@ -1,7 +1,8 @@
 import { Hono } from 'hono';
 import { h } from '../http.js';
 import { one, all, run } from '../db.js';
-import { bad, HttpError, requireAuth, encrypt, decrypt, mask, verifyPassword, hashPassword, passwordProblem, audit } from '../security.js';
+import { bad, HttpError, requireAuth, encrypt, decrypt, mask, passwordProblem, audit } from '../security.js';
+import { neonAuth, authFailure } from '../neonauth.js';
 import { PHONE_RE, cleanPhone } from './auth.js';
 
 const router = new Hono();
@@ -74,11 +75,14 @@ router.get('/travel-document', h(async (req, c) => {
 
 router.put('/password', h(async (req, c) => {
   const { currentPassword, newPassword } = req.body || {};
-  const u = await one('SELECT password_hash FROM users WHERE id = ?', req.user.id);
-  if (!(await verifyPassword(currentPassword, u.password_hash))) throw new HttpError(401, 'Current password is incorrect');
   const err = await passwordProblem(newPassword);
   if (err) throw bad(err);
-  await run('UPDATE users SET password_hash = ? WHERE id = ?', await hashPassword(newPassword), req.user.id);
+  // Neon Auth checks the current password, stores the new one and signs out the user's other devices.
+  const { error } = await neonAuth().changePassword({ currentPassword: String(currentPassword || ''), newPassword, revokeOtherSessions: true });
+  if (error) {
+    if (error.status === 400 || error.status === 401) throw new HttpError(401, 'Current password is incorrect');
+    throw authFailure(error, 'Could not change your password. Please try again.');
+  }
   await audit(req, 'auth.password_change', { severity: 'warn' });
   return c.json({ ok: true });
 }));

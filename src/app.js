@@ -1,6 +1,8 @@
 import { Hono } from 'hono';
 import { AIRLINE } from './config.js';
 import { HttpError, loadUser, securityHeaders, csrfCheck } from './security.js';
+import { withAuthContext } from './neonauth.js';
+import liveRoutes from './routes/live.js';
 import authRoutes from './routes/auth.js';
 import flightRoutes from './routes/flights.js';
 import bookingRoutes from './routes/bookings.js';
@@ -53,13 +55,14 @@ async function buildReq(c) {
 export function createApp() {
   const app = new Hono();
   app.use('*', securityHeaders);
-  app.use('/api/*', async (c, next) => {
+  // Every API request runs with Neon Auth bound to it (cookies in, Set-Cookie out).
+  app.use('/api/*', (c, next) => withAuthContext(c, async () => {
     const req = await buildReq(c);
     c.set('req', req);
     csrfCheck(req);
     req.user = await loadUser(req);
     await next();
-  });
+  }));
 
   app.get('/api/health', (c) => c.json({ ok: true, airline: AIRLINE.name, time: new Date().toISOString() }));
   app.route('/api/auth', authRoutes);
@@ -70,6 +73,7 @@ export function createApp() {
   app.route('/api/support', supportRoutes);
   app.route('/api/staff', staffRoutes);
   app.route('/api/admin', adminRoutes);
+  app.route('/api/live', liveRoutes);
 
   app.notFound((c) => c.json({ error: 'Not found' }, 404));
   app.onError((err, c) => {

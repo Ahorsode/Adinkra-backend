@@ -2,8 +2,9 @@ import { Hono } from 'hono';
 import { h, toId } from '../http.js';
 import { one, all, run, insert, tx, nowIso, allSettings, SETTING_KEYS } from '../db.js';
 import {
-  bad, HttpError, requireRole, hashPassword, passwordProblem, audit, keyFingerprint, decrypt, PBKDF2_ITERATIONS,
+  bad, HttpError, requireRole, passwordProblem, audit, keyFingerprint, decrypt,
 } from '../security.js';
+import { detachedNeonAuth, authFailure } from '../neonauth.js';
 import { AIRCRAFT, seatLayout, segmentFor, STAFF_PERMISSIONS } from '../domain.js';
 import { AIRPORT, takenSeatsFor } from '../services.js';
 import { generateFlights } from '../schedule.js';
@@ -307,9 +308,15 @@ router.post('/users', h(async (req, c) => {
   if (await one('SELECT 1 FROM users WHERE email = ?', email)) throw new HttpError(409, 'A user with that email already exists');
   const perms = role === 'admin' ? Object.keys(STAFF_PERMISSIONS) : cleanPerms(b.permissions);
   if (role === 'staff' && !perms.length) throw bad('Give the staff member at least one permission');
+  // Create the Neon Auth identity without touching the admin's own session cookies.
+  const { data, error } = await detachedNeonAuth(req.get('origin') || '').signUp.email({ email, password: b.password, name });
+  if (error) {
+    if (/already exists/i.test(error.message || '')) throw new HttpError(409, 'That email already has a sign-in account');
+    throw authFailure(error, 'Could not create the sign-in account. Please try again.');
+  }
   const id = await insert(
-    'INSERT INTO users (name, email, phone, password_hash, role, permissions) VALUES (?,?,?,?,?,?)',
-    name, email, String(b.phone || '').slice(0, 20) || null, await hashPassword(b.password), role, JSON.stringify(perms),
+    'INSERT INTO users (name, email, phone, auth_user_id, role, permissions) VALUES (?,?,?,?,?,?)',
+    name, email, String(b.phone || '').slice(0, 20) || null, data.user.id, role, JSON.stringify(perms),
   );
   await audit(req, 'rbac.user_create', { target: email, details: { role, perms }, severity: 'high' });
   return c.json({ user: userView(await one('SELECT * FROM users WHERE id = ?', id)) }, 201);
@@ -323,8 +330,8 @@ router.put('/users/:id', h(async (req, c) => {
   const active = b.active != null ? (b.active ? 1 : 0) : u.active;
   if (u.id === req.user.id && (role !== 'admin' || !active)) throw bad('You cannot remove your own admin access');
   const perms = role === 'admin' ? Object.keys(STAFF_PERMISSIONS) : role === 'traveler' ? [] : b.permissions ? cleanPerms(b.permissions) : JSON.parse(u.permissions);
+  // A deactivated account is refused on its very next request (loadUser checks `active`).
   await run('UPDATE users SET role = ?, permissions = ?, active = ? WHERE id = ?', role, JSON.stringify(perms), active, u.id);
-  if (!active) await run('DELETE FROM sessions WHERE user_id = ?', u.id);
   await audit(req, 'rbac.user_update', { target: u.email, details: { from: { role: u.role, perms: JSON.parse(u.permissions), active: !!u.active }, to: { role, perms, active: !!active } }, severity: 'high' });
   return c.json({ user: userView(await one('SELECT * FROM users WHERE id = ?', u.id)) });
 }));
@@ -350,21 +357,22 @@ router.get('/security', h(async (_req, c) => {
     }
     return { field, records, verified: ok, failures: failed };
   }));
-  const [settings, sevRows, failed24, admins, legacyPwd, cardNumbers, activeSessions] = await Promise.all([
+  const [settings, sevRows, failed24, admins, unlinked, cardNumbers, activeSessions] = await Promise.all([
     allSettings(),
     all('SELECT severity, COUNT(*) AS n FROM audit_log WHERE created_at >= ? GROUP BY severity', day),
     one("SELECT COUNT(*) AS n FROM audit_log WHERE action = 'auth.login_failed' AND created_at >= ?", day),
     one("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND active = 1"),
-    one("SELECT COUNT(*) AS n FROM users WHERE password_hash NOT LIKE 'pbkdf2$%'"),
+    one('SELECT COUNT(*) AS n FROM users WHERE auth_user_id IS NULL'),
     one("SELECT COUNT(*) AS n FROM payments WHERE account_masked ~ '[0-9]{8}'"),
-    one('SELECT COUNT(*) AS n FROM sessions WHERE expires_at > ?', nowIso()),
+    // Sessions live in Neon Auth's schema on the same database.
+    one('SELECT COUNT(*) AS n FROM neon_auth.session WHERE "expiresAt" > now()').catch(() => ({ n: null })),
   ]);
   const checks = [
     { label: 'Personal identifiers (Ghana Card, passports) encrypted at rest with AES-256-GCM', ok: encFields.every((f) => f.failures === 0) },
-    { label: 'All passwords stored as salted PBKDF2-SHA256 hashes', ok: legacyPwd.n === 0 },
+    { label: 'Every account signs in through Neon Auth (Managed Better Auth); the API never stores passwords', ok: unlinked.n === 0 },
     { label: 'Role-based access control enforced on staff and admin APIs', ok: true },
     { label: `Password policy: minimum ${settings.password_min_length} characters, letters + digits`, ok: Number(settings.password_min_length) >= 8 },
-    { label: `Sessions expire after ${settings.session_timeout_hours} hours (HttpOnly, SameSite=Strict cookie)`, ok: Number(settings.session_timeout_hours) <= 12 },
+    { label: `Sessions expire after ${settings.session_timeout_hours} hours (HttpOnly, Secure, first-party cookies)`, ok: Number(settings.session_timeout_hours) <= 12 },
     { label: 'Staff see masked passport numbers unless access is justified and logged', ok: settings.mask_pii_for_staff === '1' },
     { label: `Audit and notification data retained for ${settings.data_retention_days} days`, ok: Number(settings.data_retention_days) <= 730 },
     { label: 'Card numbers never stored (only brand + last 4 digits kept)', ok: cardNumbers.n === 0 },
@@ -373,7 +381,7 @@ router.get('/security', h(async (_req, c) => {
   return c.json({
     encryption: {
       algorithm: 'AES-256-GCM (96-bit IV, 128-bit auth tag)', keyFingerprint: keyFingerprint(), fields: encFields,
-      passwordHashing: `PBKDF2-SHA256 (${PBKDF2_ITERATIONS.toLocaleString('en-US')} iterations), 16-byte salt`,
+      passwordHashing: 'Managed by Neon Auth (Better Auth); passwords never reach this API’s tables',
     },
     stats: {
       activeSessions: activeSessions.n,

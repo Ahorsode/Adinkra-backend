@@ -12,7 +12,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { connect, setDefaultDb, insertMany, one, all } from '../src/db.js';
 import { AIRPORTS, AIRCRAFT, seatLayout, fareFor, taxesFor, STAFF_PERMISSIONS, cargoQuote } from '../src/domain.js';
-import { hashPassword, encrypt } from '../src/security.js';
+import crypto from 'node:crypto';
+import { encrypt } from '../src/security.js';
+import { detachedNeonAuth } from '../src/neonauth.js';
 import { flightRows, FLIGHT_COLS } from '../src/schedule.js';
 import { AIRLINE } from '../src/config.js';
 
@@ -102,6 +104,7 @@ async function build({ light }) {
   };
   const ids = Object.fromEntries(Object.keys(T).map((k) => [k, 0]));
   const nextId = (t) => ++ids[t];
+  T.accounts = []; // { row, password } for each seeded sign-in account (not a table)
 
   // Users (ids 1–6; Abena is id 3, used as the staff author of a seeded support reply)
   const allPerms = JSON.stringify(Object.keys(STAFF_PERMISSIONS));
@@ -109,13 +112,15 @@ async function build({ light }) {
   const mk = async (key, u, role, perms, extra = {}) => {
     const row = {
       id: nextId('users'), name: u.name, email: u.email, phone: extra.phone || '0244000000', national_id_enc: encrypt(extra.ghanaCard || null),
-      password_hash: await hashPassword(u.password), role, permissions: perms, frequent_flyer_no: extra.ff || null,
+      // The sign-in identity lives in Neon Auth; its id is filled in by linkAccounts() before insert.
+      auth_user_id: null, role, permissions: perms, frequent_flyer_no: extra.ff || null,
       passport_enc: encrypt(extra.passport || null), passport_expiry: extra.passportExpiry || null, nationality: extra.nationality || null,
       dob: extra.dob || null, emergency_name: extra.emName || null, emergency_relation: extra.emRel || null, emergency_phone: extra.emPhone || null,
       created_at: iso(now - 200 * 24 * HOUR),
     };
     T.users.push(row);
     users[key] = row;
+    T.accounts.push({ row, password: u.password });
   };
   await mk('admin', DEMO_ACCOUNTS.admin, 'admin', allPerms, { phone: '0201112233' });
   await mk('admin2', DEMO_ACCOUNTS.admin2, 'admin', allPerms, { phone: '0501234567' });
@@ -327,7 +332,7 @@ async function build({ light }) {
 }
 
 const COLS = {
-  users: ['id', 'name', 'email', 'phone', 'national_id_enc', 'password_hash', 'role', 'permissions', 'frequent_flyer_no', 'passport_enc', 'passport_expiry', 'nationality', 'dob', 'emergency_name', 'emergency_relation', 'emergency_phone', 'created_at'],
+  users: ['id', 'name', 'email', 'phone', 'national_id_enc', 'auth_user_id', 'role', 'permissions', 'frequent_flyer_no', 'passport_enc', 'passport_expiry', 'nationality', 'dob', 'emergency_name', 'emergency_relation', 'emergency_phone', 'created_at'],
   routes: ['id', 'flight_no', 'origin', 'destination', 'segment', 'base_price', 'duration_min', 'aircraft', 'dep_time', 'days', 'active', 'created_at'],
   flights: ['id', ...FLIGHT_COLS, 'status', 'delay_min', 'remarks'],
   bookings: ['id', 'pnr', 'user_id', 'contact_email', 'contact_phone', 'trip_type', 'tier', 'segment', 'status', 'total', 'taxes', 'created_at', 'updated_at'],
@@ -344,12 +349,65 @@ const COLS = {
   audit_log: ['id', 'user_id', 'action', 'target', 'details', 'severity', 'ip', 'created_at'],
 };
 
+// Every seeded sign-in account (DEMO_ACCOUNTS plus the two extra scenario users).
+const SEED_ACCOUNTS = [
+  ...Object.values(DEMO_ACCOUNTS),
+  { name: 'Yaw Darko (Flight Ops)', email: 'yaw.darko@adinkra-air.test', password: 'Staff@2026' },
+  { name: 'Ama Owusu', email: 'ama.owusu@example.com', password: 'Traveler@2026' },
+];
+
+// Neon Auth only accepts sign-ups from trusted origins; localhost is trusted on every branch by default.
+const SEED_ORIGIN = process.env.SEED_AUTH_ORIGIN || 'http://localhost:3000';
+
+/**
+ * Returns the Neon Auth user id for an account, creating it if needed (idempotent: an existing
+ * account is signed into to read its id). Needs NEON_AUTH_BASE_URL for the target branch.
+ */
+export async function ensureAuthUser({ email, password, name }) {
+  process.env.NEON_AUTH_COOKIE_SECRET ||= crypto.randomBytes(32).toString('base64'); // cookies are discarded here
+  const auth = detachedNeonAuth(SEED_ORIGIN);
+  // Neon Auth allows ~10 calls per few seconds per IP; wait and retry when it says so.
+  const withRetry = async (fn) => {
+    for (let i = 0; ; i++) {
+      const r = await fn();
+      if (r.error?.status !== 429 || i >= 5) return r;
+      await new Promise((ok) => setTimeout(ok, 11000));
+    }
+  };
+  const up = await withRetry(() => auth.signUp.email({ email, password, name }));
+  if (up.data?.user) return up.data.user.id;
+  if (/already exists/i.test(up.error?.message || '')) {
+    const inn = await withRetry(() => auth.signIn.email({ email, password }));
+    if (inn.data?.user) return inn.data.user.id;
+    throw new Error(`Neon Auth: ${email} exists but the demo password was rejected (${inn.error?.message}). Reset it or delete the user in Neon.`);
+  }
+  throw new Error(`Neon Auth: could not create ${email}: ${up.error?.message || 'unknown error'}`);
+}
+
+/** Links existing demo profiles (auth_user_id IS NULL) to Neon Auth identities. For databases seeded before Neon Auth. */
+export async function linkDemoAccounts({ log = () => {} } = {}) {
+  await applySchema();
+  let linked = 0;
+  for (const acct of SEED_ACCOUNTS) {
+    const row = await one('SELECT id FROM users WHERE email = ? AND auth_user_id IS NULL', acct.email);
+    if (!row) continue;
+    const authId = await ensureAuthUser(acct);
+    await one('UPDATE users SET auth_user_id = ? WHERE id = ? RETURNING id', authId, row.id);
+    log(`  linked ${acct.email}`);
+    linked++;
+  }
+  return linked;
+}
+
 /** Seeds an empty database. Returns false if it already has data. */
 export async function seedIfEmpty({ light = false, log = () => {} } = {}) {
   await applySchema();
   if ((await one('SELECT COUNT(*) AS n FROM airports')).n > 0) return false;
   const t0 = Date.now();
   const T = await build({ light });
+  log(`Creating ${T.accounts.length} demo sign-in accounts in Neon Auth…`);
+  for (const { row, password } of T.accounts) row.auth_user_id = await ensureAuthUser({ email: row.email, password, name: row.name });
+  delete T.accounts;
   log(`Built ${Object.values(T).reduce((s, r) => s + r.length, 0).toLocaleString()} rows in ${((Date.now() - t0) / 1000).toFixed(1)}s; inserting…`);
   await insertMany('airports', ['code', 'name', 'city', 'country', 'zone'], AIRPORTS);
   for (const [table, cols] of Object.entries(COLS)) {
@@ -375,6 +433,11 @@ if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.me
   const sql = connect(url, { max: 1, prepare: false });
   setDefaultDb(sql);
   try {
+    if (process.argv.includes('--link-auth')) {
+      console.log('Linking demo accounts to Neon Auth…');
+      console.log(`Linked ${await linkDemoAccounts({ log: console.log })} account(s).`);
+      process.exit(0);
+    }
     const reset = process.argv.includes('--reset');
     if (reset) {
       console.log('Dropping existing tables…');
