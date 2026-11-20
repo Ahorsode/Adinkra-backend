@@ -54,6 +54,23 @@ applies the app's rules: the profile must be linked and **active**, and the sess
 admin's **session timeout** setting. Roles, staff permissions, Ghana Card validation, login lockout and the
 audit log are unchanged.
 
+### Continue with Google
+
+Google is a Neon Auth social provider. `POST /api/auth/google` gets Google's URL from Neon (and sets a
+short-lived challenge cookie); after Google, Neon sends the browser to `/api/auth/callback`, where the toolkit
+swaps the one-time verifier for a session; the website then calls `POST /api/auth/oauth-finish`, which links an
+existing profile with the same (verified) email or creates a traveller profile. New Google users are asked once
+for their phone and Ghana Card (`#/complete-profile`), like normal registration.
+
+The project currently uses **Neon's shared Google keys** (development only: Google's screen says
+"continue to neon.tech"). To show your own name and logo, create an OAuth client in Google Cloud Console
+(type *Web application*, redirect URI `<NEON_AUTH_BASE_URL>/callback/google`), save the client secret in a
+file, and run (yourself, so the secret stays on your machine):
+
+```powershell
+neon neon-auth oauth-provider update --provider-id google --oauth-client-id <client-id> --oauth-client-secret-file <path-to-secret-file>
+```
+
 ### How live status works
 
 `GET /api/live/board` and `/api/live/status` return a **sealed** live query (encrypted, valid ~60 s) over the
