@@ -416,6 +416,11 @@ test('Admin scenarios 3.1–3.5', async () => {
   await g.login({ email: gateEmail, password: 'Welcome@2026' });
   assert.equal((await g.get('/api/staff/support')).status, 403);
   assert.equal((await g.get('/api/staff/flights')).status, 200);
+  // Permission changes apply on the next request; the flight list needs gate or ops.
+  assert.equal((await a.put(`/api/admin/users/${u.body.user.id}`, { permissions: ['support'] })).status, 200);
+  assert.equal((await g.get('/api/staff/flights')).status, 403, 'support-only staff cannot list flights');
+  assert.equal((await g.get('/api/staff/support')).status, 200);
+  assert.deepEqual((await g.get('/api/auth/me')).body.user.permissions, ['support']);
   const users = await a.get('/api/admin/users?q=gate');
   assert.ok(users.body.users.some((x) => x.email === gateEmail));
   // Deactivating an account locks it out on its next request, even with a live Neon Auth session.

@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { h, toId } from '../http.js';
 import { one, all, run, tx, insertMany, nowIso, setting } from '../db.js';
-import { bad, HttpError, requireRole, requirePerm, parseBoardingCode, audit } from '../security.js';
+import { bad, HttpError, requireRole, requirePerm, requireAnyPerm, parseBoardingCode, audit } from '../security.js';
 import { BAGGAGE, CARGO_TYPES, AIRCRAFT, seatLayout, TIERS } from '../domain.js';
 import {
   getFlight, queryFlights, flightView, bookingDetail, changeOptions, applyChange, cancelQuote, cancelBooking, notify,
@@ -67,7 +67,8 @@ router.post('/support/:ref/reply', requirePerm('support'), h(async (req, c) => {
 }));
 
 // ---------------- Flights for gate / manifests / ops ----------------
-router.get('/flights', h(async (req, c) => {
+// Flight list feeds the gate, manifest and ops screens only.
+router.get('/flights', requireAnyPerm('gate', 'ops'), h(async (req, c) => {
   const hoursBack = Math.min(48, Number(req.query.back) || 6);
   const hoursFwd = Math.min(72, Number(req.query.ahead) || 30);
   const from = new Date(Date.now() - hoursBack * 3600000).toISOString();

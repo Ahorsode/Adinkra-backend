@@ -161,6 +161,17 @@ export const requirePerm = (perm) => async (c, next) => {
   await next();
 };
 
+/** Passes when the user holds at least one of the listed permissions (admins hold them all). */
+export const requireAnyPerm = (...perms) => async (c, next) => {
+  const req = c.get('req');
+  if (!req.user) throw new HttpError(401, 'Please sign in to continue');
+  if (!perms.some((p) => hasPerm(req.user, p))) {
+    await audit(req, 'rbac.denied', { target: req.originalUrl, details: `needs one of: ${perms.join(', ')}`, severity: 'warn' });
+    throw new HttpError(403, 'Your account lacks the permission for this area');
+  }
+  await next();
+};
+
 // ---------- Audit log ----------
 export async function audit(req, action, { target = null, details = null, severity = 'info', userId } = {}) {
   await run(
