@@ -6,6 +6,9 @@
   // node:crypto (AES-GCM, HMAC), node:async_hooks and Buffer.
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  // Run the Worker near the database (Neon is in aws-us-east-2) instead of near each visitor:
+  // a request makes several queries, so being close to Postgres matters more.
+  "placement": { "mode": "smart" },
 
   // Neon Postgres through Hyperdrive (connection pooling close to the Worker).
   // Create it once with (caching off, so a booking never shows stale seats or status):
