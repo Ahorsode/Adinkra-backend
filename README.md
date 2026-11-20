@@ -43,6 +43,12 @@ npm install
 *London* is closest to Ghana). Under **Connect**, turn **Connection pooling off** and copy the *direct*
 connection string (the host must **not** contain `-pooler`). Hyperdrive does its own pooling.
 
+Save it in a file named `.env` in this folder (git-ignored), on one line:
+
+```
+DATABASE_URL=postgresql://...your direct Neon string...
+```
+
 **3. Generate the encryption keys.** This writes them to `.dev.vars` (git-ignored) and prints them.
 Keep a copy somewhere safe: if `DATA_KEY` is lost, encrypted passports and Ghana Card numbers can't be read.
 
@@ -50,12 +56,10 @@ Keep a copy somewhere safe: if `DATA_KEY` is lost, encrypted passports and Ghana
 npm run secrets:generate
 ```
 
-**4. Create the tables and load the demo data into Neon** (about a minute; uses the same keys as the Worker):
+**4. Create the tables and load the demo data into Neon** (about a minute). It reads `.env` and `.dev.vars`,
+so the data is encrypted with the same keys the Worker will use:
 
 ```powershell
-$env:DATABASE_URL = "postgresql://...your direct Neon string..."
-$env:DATA_KEY = "...from step 3..."
-$env:HMAC_KEY = "...from step 3..."
 npm run db:seed
 ```
 
@@ -71,24 +75,21 @@ npx wrangler hyperdrive create adinkra-db --caching-disabled --connection-string
 
 Paste the `id` it prints into `wrangler.jsonc` → `hyperdrive[0].id`.
 
-**6. Add the secrets to the Worker** (paste the values from step 3 when asked):
-
-```powershell
-npx wrangler secret put DATA_KEY
-```
-
-```powershell
-npx wrangler secret put HMAC_KEY
-```
-
-**7. Deploy**
+**6. Deploy, then upload the two keys from `.dev.vars` as Worker secrets**
 
 ```powershell
 npm run deploy
 ```
 
-Wrangler prints the Worker URL, e.g. `https://adinkra-airways-api.<your-subdomain>.workers.dev`.
-Put it into the frontend's `vercel.json` rewrite, then deploy the frontend (see its README).
+```powershell
+npm run secrets:upload
+```
+
+Secrets take effect straight away; no second deploy is needed.
+
+**7. Connect the frontend.** `npm run deploy` printed the Worker URL, e.g.
+`https://adinkra-airways-api.<your-subdomain>.workers.dev`. Put it into the frontend's `vercel.json` rewrite,
+then deploy the frontend (see its README).
 
 **8. Check it** (through Vercel once the frontend is up, or the Worker URL directly):
 
@@ -117,10 +118,10 @@ npm run db:local
 In a second terminal (first time only, then whenever you want fresh demo data):
 
 ```powershell
-$env:DATABASE_URL = "postgres://postgres:postgres@127.0.0.1:5433/postgres"; Get-Content .dev.vars | ForEach-Object { $k, $v = $_ -split '=', 2; Set-Item "env:$k" $v }; npm run db:reset
+$env:DATABASE_URL = "postgres://postgres:postgres@127.0.0.1:5433/postgres"; npm run db:reset
 ```
 
-Then run the Worker locally (`.dev.vars` needs `DB_MAX_CONNECTIONS=1` for PGlite):
+Then run the Worker locally:
 
 ```powershell
 npm run dev

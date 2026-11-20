@@ -8,12 +8,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:schema": "node scripts/apply-schema.js",
-    "db:seed": "node scripts/seed.js",
-    "db:reset": "node scripts/seed.js --reset",
+    "db:schema": "node --env-file-if-exists=.dev.vars --env-file-if-exists=.env scripts/apply-schema.js",
+    "db:seed": "node --env-file-if-exists=.dev.vars --env-file-if-exists=.env scripts/seed.js",
+    "db:reset": "node --env-file-if-exists=.dev.vars --env-file-if-exists=.env scripts/seed.js --reset",
     "db:local": "node scripts/local-db.js",
     "test": "node --test test/*.test.js",
-    "secrets:generate": "node scripts/generate-keys.js"
+    "secrets:generate": "node scripts/generate-keys.js",
+    "secrets:upload": "wrangler secret bulk .dev.vars"
   },
   "dependencies": {
     "hono": "^4.13.19",

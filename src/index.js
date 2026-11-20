@@ -10,7 +10,9 @@ const app = createApp();
 function openDb(env) {
   const url = env.HYPERDRIVE?.connectionString || env.DATABASE_URL;
   if (!url) throw new Error('No database configured: add the HYPERDRIVE binding (or DATABASE_URL for local dev)');
-  return connect(url, { max: Number(env.DB_MAX_CONNECTIONS) || 5 });
+  // Local PGlite (wrangler dev) runs every connection in one session, so use a single connection there.
+  const local = /@(127\.0\.0\.1|localhost)[:/]/.test(url);
+  return connect(url, { max: Number(env.DB_MAX_CONNECTIONS) || (local ? 1 : 5) });
 }
 
 export default {
