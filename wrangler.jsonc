@@ -17,7 +17,7 @@
   "hyperdrive": [
     {
       "binding": "HYPERDRIVE",
-      "id": "REPLACE_WITH_YOUR_HYPERDRIVE_ID",
+      "id": "8fba2e0e35164da6a9e6f539e249bb15",
       // Used by `wrangler dev` only (see `npm run db:local`).
       "localConnectionString": "postgres://postgres:postgres@127.0.0.1:5433/postgres"
     }
